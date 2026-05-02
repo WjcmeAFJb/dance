@@ -14,6 +14,35 @@ type RecordValue = CommandDescriptor | object | vscode.Uri | number | string;
 const enum Constants {
   NextMask = 0xff,
   PrevShift = 8,
+
+  /** Max entries in a single buffer before it is archived. */
+  BufferSize = 8192,
+
+  /**
+   * Max number of archived buffers retained on the recorder. When this is
+   * exceeded the oldest buffer is dropped (FIFO). Each buffer holds up to
+   * `BufferSize` entries plus its own deduplicating store of objects/strings.
+   *
+   * Active `Recording`s hold strong references to their buffer, so user
+   * macros saved before eviction continue to replay correctly even after
+   * the recorder forgets the buffer; only inspection of older history is
+   * truncated.
+   */
+  MaxPreviousBuffers = 16,
+}
+
+/**
+ * Per-buffer dedup store. Lives in a WeakMap keyed by the buffer itself so
+ * it is GC'd along with the buffer once no `Recording` or `Cursor` holds a
+ * reference.
+ */
+interface BufferStore {
+  readonly storedObjects: (object | string)[];
+  readonly storedObjectsMap: Map<object | string, number>;
+}
+
+function newBufferStore(): BufferStore {
+  return { storedObjects: [], storedObjectsMap: new Map() };
 }
 
 type IntArray<E extends BaseEntry<any>> = E extends BaseEntry<infer I>
@@ -26,10 +55,20 @@ type IntArray<E extends BaseEntry<any>> = E extends BaseEntry<infer I>
  */
 export class Recorder implements vscode.Disposable {
   private readonly _descriptors: readonly CommandDescriptor[];
+  /**
+   * `O(1)` reverse index for descriptor lookup. Replaces a per-record linear
+   * scan over `_descriptors` (~200 entries) on every recorded Dance command.
+   */
+  private readonly _descriptorIndices: ReadonlyMap<CommandDescriptor, number>;
   private readonly _onDidAddEntry = new vscode.EventEmitter<Entry.Any>();
   private readonly _previousBuffers: Recorder.Buffer[] = [];
-  private readonly _storedObjects: (object | string)[] = [];
-  private readonly _storedObjectsMap = new Map<object | string, number>();
+  /**
+   * Per-buffer dedup store. Buffer entries reference into THIS buffer's
+   * `storedObjects` array, so dropping a buffer also frees every object it
+   * referenced.
+   */
+  private readonly _bufferStores = new WeakMap<Recorder.Buffer, BufferStore>();
+  private _currentStore: BufferStore = newBufferStore();
   private readonly _statusBar: StatusBar;
   private readonly _subscriptions: vscode.Disposable[] = [];
 
@@ -70,6 +109,14 @@ export class Recorder implements vscode.Disposable {
 
     this._statusBar = extension.statusBar;
     this._descriptors = Object.values(extension.commands);
+
+    const indices = new Map<CommandDescriptor, number>();
+    for (let i = 0; i < this._descriptors.length; i++) {
+      indices.set(this._descriptors[i], i);
+    }
+    this._descriptorIndices = indices;
+
+    this._bufferStores.set(this._buffer, this._currentStore);
   }
 
   public dispose() {
@@ -128,21 +175,35 @@ export class Recorder implements vscode.Disposable {
   /**
    * Archives the current buffer to `_previousBuffers` if its size exceeded a
    * threshold and if no recording is currently ongoing.
+   *
+   * Also enforces a FIFO cap on the number of retained buffers: once
+   * `MaxPreviousBuffers` is reached the oldest is dropped, releasing every
+   * stored object it referenced. `Recording` instances hold their own strong
+   * reference to the buffer they were captured against, so user macros
+   * survive eviction even though the recorder forgets the buffer.
    */
   private _archiveBufferIfNeeded() {
-    if (this._activeRecordingTokens.length > 0 || this._buffer.length < 8192) {
+    if (this._activeRecordingTokens.length > 0 || this._buffer.length < Constants.BufferSize) {
       return;
     }
 
     this._previousBuffers.push(this._buffer);
     this._buffer = [];
+    this._currentStore = newBufferStore();
+    this._bufferStores.set(this._buffer, this._currentStore);
+
+    while (this._previousBuffers.length > Constants.MaxPreviousBuffers) {
+      this._previousBuffers.shift();
+    }
   }
 
   private _storeObject<T extends object | string>(value: T) {
-    let i = this._storedObjectsMap.get(value);
+    const store = this._currentStore;
+    let i = store.storedObjectsMap.get(value);
 
     if (i === undefined) {
-      this._storedObjectsMap.set(value, i = this._storedObjects.push(value) - 1);
+      i = store.storedObjects.push(value) - 1;
+      store.storedObjectsMap.set(value, i);
     }
 
     return i;
@@ -163,17 +224,22 @@ export class Recorder implements vscode.Disposable {
   }
 
   /**
-   * Returns the stored object at the given index.
+   * Returns the stored object at the given index in the given buffer.
+   *
+   * The buffer is required because each buffer carries its own dedup store;
+   * the same numeric index points at different objects in different buffers.
+   * Defaults to the current (still-being-written) buffer for backwards
+   * compatibility with callers that look up objects in fresh entries.
    */
-  public getObject<T extends object>(index: number) {
-    return this._storedObjects[index] as T;
+  public getObject<T extends object>(index: number, buffer: Recorder.Buffer = this._buffer) {
+    return this._bufferStores.get(buffer)!.storedObjects[index] as T;
   }
 
   /**
-   * Returns the stored string at the given index.
+   * Returns the stored string at the given index in the given buffer.
    */
-  public getString(index: number) {
-    return this._storedObjects[index] as string;
+  public getString(index: number, buffer: Recorder.Buffer = this._buffer) {
+    return this._bufferStores.get(buffer)!.storedObjects[index] as string;
   }
 
   /**
@@ -336,7 +402,7 @@ export class Recorder implements vscode.Disposable {
    * Records the invocation of a command.
    */
   public recordCommand(descriptor: CommandDescriptor, argument: Record<string, any>) {
-    const descriptorIndex = this._descriptors.indexOf(descriptor),
+    const descriptorIndex = this._descriptorIndices.get(descriptor) ?? -1,
           argumentIndex = this._storeObject(argument);
 
     this._record(Entry.ExecuteCommand, descriptorIndex, argumentIndex);
@@ -1080,7 +1146,7 @@ export class InsertBeforeEntry extends BaseEntry.define<[insertedText: string]>(
   }
 
   public insertedText() {
-    return this.recorder.getString(this.item(0));
+    return this.recorder.getString(this.item(0), this.buffer);
   }
 
   public items() {
@@ -1107,7 +1173,7 @@ export class InsertAfterEntry extends BaseEntry.define<[insertedText: string]>(1
   }
 
   public insertedText() {
-    return this.recorder.getString(this.item(0));
+    return this.recorder.getString(this.item(0), this.buffer);
   }
 
   public items() {
@@ -1196,7 +1262,7 @@ export class ReplaceWithEntry extends BaseEntry.define<[text: string]>(1) {
   }
 
   public text() {
-    return this.recorder.getString(this.item(0));
+    return this.recorder.getString(this.item(0), this.buffer);
   }
 
   public items() {
@@ -1213,7 +1279,7 @@ export class ChangeTextEditorEntry extends BaseEntry.define<[uri: vscode.Uri]>(1
   }
 
   public uri() {
-    return this.recorder.getObject<vscode.Uri>(this.item(0));
+    return this.recorder.getObject<vscode.Uri>(this.item(0), this.buffer);
   }
 
   public items() {
@@ -1232,7 +1298,7 @@ export class ChangeTextEditorModeEntry extends BaseEntry.define<[mode: Mode]>(1)
   }
 
   public mode() {
-    return this.recorder.getObject<Mode>(this.item(0));
+    return this.recorder.getObject<Mode>(this.item(0), this.buffer);
   }
 
   public items() {
@@ -1260,7 +1326,7 @@ export class ExecuteCommandEntry extends BaseEntry.define<
   }
 
   public argument() {
-    return this.recorder.getObject<{}>(this.item(1));
+    return this.recorder.getObject<{}>(this.item(1), this.buffer);
   }
 
   public items() {
@@ -1279,11 +1345,11 @@ export class ExecuteExternalCommandEntry extends BaseEntry.define<
   }
 
   public identifier() {
-    return this.recorder.getString(this.item(0));
+    return this.recorder.getString(this.item(0), this.buffer);
   }
 
   public argument() {
-    return this.recorder.getObject<{}>(this.item(1));
+    return this.recorder.getObject<{}>(this.item(1), this.buffer);
   }
 
   public items() {

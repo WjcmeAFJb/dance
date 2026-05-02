@@ -4,3 +4,5 @@ node_modules/
 .envrc
 *.log
 *.vsix
+bench/out/
+package-lock.json
