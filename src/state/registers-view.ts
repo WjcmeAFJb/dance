@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { Register, Registers, RegisterSet } from "./registers";
+import { Selections } from "../api";
 
 /**
  * A {@link vscode.TreeDataProvider} for Dance registers.
@@ -223,9 +224,36 @@ class RegisterTreeItem extends vscode.TreeItem implements vscode.Disposable {
     if (this._values === undefined) {
       this._values = (async () => {
         try {
+          const items: ValueTreeItem[] = [];
+
+          // Saved-selection registers (e.g. the default `^` mark register
+          // for `selections.save`) only set `_selections` via
+          // `replaceSelectionSet`, never `_values`. Display them too,
+          // otherwise `^` looks empty even when marks are saved.
+          if (this.register.canReadSelections()) {
+            const selectionSet = this.register.getSelectionSet();
+
+            if (selectionSet !== undefined) {
+              const document = selectionSet.document,
+                    selections = selectionSet.restore();
+
+              for (const selection of selections) {
+                items.push(new ValueTreeItem(
+                  formatSelection(selection, document), "selection",
+                ));
+              }
+            }
+          }
+
           const values = await this.register.get();
 
-          return values?.map((v) => new ValueTreeItem(v)) ?? [];
+          if (values !== undefined) {
+            for (const value of values) {
+              items.push(new ValueTreeItem(value));
+            }
+          }
+
+          return items;
         } catch (e) {
           return [new ValueTreeItem(`${e}`, "warning")];
         }
@@ -246,6 +274,25 @@ class ValueTreeItem extends vscode.TreeItem {
 
     this.iconPath = new vscode.ThemeIcon(icon);
   }
+}
+
+/**
+ * Returns a human-friendly one-line label for a saved selection: the
+ * anchor → active position followed by a truncated text preview. Newlines
+ * in the preview are replaced with `⏎` so the label always fits on a
+ * single tree row.
+ */
+function formatSelection(selection: vscode.Selection, document: vscode.TextDocument) {
+  const positions = Selections.toString(selection);
+  const text = document.getText(selection).replace(/\s+/g, " ").trim();
+  const maxText = 60;
+  const preview = text.length === 0
+    ? ""
+    : text.length > maxText
+      ? `  ${text.slice(0, maxText - 1)}…`
+      : `  ${text}`;
+
+  return `${positions}${preview}`;
 }
 
 type TreeItem = RegisterSetTreeItem | RegisterTreeItem | ValueTreeItem;
